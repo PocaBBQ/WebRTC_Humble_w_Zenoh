@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>zenoh-signaled WebRTC Viewer</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root { --fg:#111; --muted:#666; --bg:#fafafa; --accent:#2563eb; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 18px; color: var(--fg); background: var(--bg); }
+  h1 { font-size: 1.1rem; margin: 0 0 12px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; margin: 10px 0; }
+  label { color: var(--muted); }
+  input[type=text], select { font-size: 14px; padding: 6px 8px; min-width: 140px; }
+  input#wsurl { min-width: 320px; }
+  button { font-size: 14px; padding: 6px 10px; border: 1px solid #ccc; border-radius: 8px; background: white; cursor: pointer; }
+  button.primary { background: var(--accent); color: white; border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .panel { max-width: 980px; }
+  video { display:block; width: 100%; max-width: 980px; background: #000; border-radius: 12px; }
+  #status { margin-top: 8px; color: var(--muted); }
+  #log { margin-top: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color:#444; max-height: 160px; overflow:auto; background:#fff; border:1px solid #e5e7eb; border-radius: 8px; padding:8px; }
+</style>
+</head>
+<body>
+  <div class="panel">
+    <h1>Viewer</h1>
+
+    <div class="row">
+      <label>Bridge&nbsp;WS:</label>
+      <input id="wsurl" type="text" value="ws://localhost:9296/ws" />
+      <label>Room:</label>
+      <input id="room" type="text" value="cam1" />
+      <button id="connect" class="primary">Connect</button>
+      <button id="disconnect">Disconnect</button>
+    </div>
+
+    <div class="row">
+      <label>Resolution:</label>
+      <select id="res"></select>
+      <label>FPS:</label>
+      <select id="fps"></select>
+      <button id="start" class="primary" disabled>Start</button>
+      <button id="stop" disabled>Stop</button>
+    </div>
+
+    <video id="v" autoplay playsinline controls muted></video>
+    <div id="status">Idle…</div>
+    <pre id="log"></pre>
+  </div>
+
+<script>
+(() => {
+  // ---- elements ----
+  const wsUrlInput = document.getElementById('wsurl');
+  const roomInput  = document.getElementById('room');
+  const resSel     = document.getElementById('res');
+  const fpsSel     = document.getElementById('fps');
+  const btnConnect = document.getElementById('connect');
+  const btnDisconnect = document.getElementById('disconnect');
+  const btnStart   = document.getElementById('start');
+  const btnStop    = document.getElementById('stop');
+  const videoEl    = document.getElementById('v');
+  const statusEl   = document.getElementById('status');
+  const logEl      = document.getElementById('log');
+
+  // ---- state ----
+  let ws = null;
+  let pc = null;
+  let pendingIncomingIce = [];
+  let pendingOutgoingIce = [];
+  let offered = false;
+
+  // ---- utils ----
+  const log = (...a) => { const s = a.map(x => (typeof x === 'string' ? x : JSON.stringify(x))).join(' '); logEl.textContent += s + '\n'; logEl.scrollTop = logEl.scrollHeight; };
+  const setStatus = (s) => { statusEl.textContent = s; };
+
+  // Fill resolution / fps dropdowns from caps object
+  function fillCaps(caps) {
+    if (!caps) { setStatus('Waiting for camera caps…'); return; }
+    const fpsByRes = caps.fps_by_resolution || {};
+    const resolutions = caps.resolutions && caps.resolutions.length
+      ? caps.resolutions
+      : Object.keys(fpsByRes);
+
+    resSel.innerHTML = '';
+    for (const r of resolutions) {
+      const o = document.createElement('option');
+      o.value = o.textContent = r;
+      resSel.appendChild(o);
+    }
+
+    const updateFps = () => {
+      const arr = fpsByRes[resSel.value] || [];
+      fpsSel.innerHTML = '';
+      for (const f of arr) {
+        const o = document.createElement('option');
+        o.value = String(f);
+        o.textContent = `${f} fps`;
+        fpsSel.appendChild(o);
+      }
+    };
+    resSel.onchange = updateFps;
+    updateFps();
+  }
+
+  // ---- WebSocket wiring ----
+  btnConnect.onclick = () => {
+    if (ws) return;
+    const url  = wsUrlInput.value.trim();
+    const room = roomInput.value.trim() || 'cam1';
+    try {
+      ws = new WebSocket(url);
+    } catch (e) {
+      setStatus('WS open failed'); log('WS open error:', e); return;
+    }
+
+    setStatus('Connecting bridge…');
+
+    ws.onopen = () => log('WS open');
+    ws.onclose = () => {
+      log('WS closed');
+      setStatus('Disconnected.');
+      btnStart.disabled = true;
+      btnStop.disabled = true;
+      ws = null;
+    };
+    ws.onerror = (ev) => { setStatus('WS error'); log('WS error', ev); };
+
+    ws.onmessage = async (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+
+      if (msg.action === 'welcome') {
+        log('welcome');
+        ws.send(JSON.stringify({ action: 'subscribe', room }));
+      }
+      else if (msg.action === 'subscribed') {
+        log('subscribed; caps:', msg.caps ? 'ok' : 'none');
+        fillCaps(msg.caps);
+        btnStart.disabled = !msg.caps;
+        setStatus(msg.caps ? 'Ready.' : 'Waiting for camera caps…');
+      }
+      else if (msg.action === 'answer') {
+        // Set remote SDP first, then drain any buffered ICE
+        try {
+          await pc.setRemoteDescription({ type: msg.type || 'answer', sdp: msg.sdp });
+          log('answer applied');
+          for (const c of pendingIncomingIce) {
+            try { await pc.addIceCandidate(c); } catch (e) { log('addIce (drain) err', e); }
+          }
+          pendingIncomingIce = [];
+        } catch (e) {
+          log('setRemoteDescription error:', e);
+        }
+      }
+      else if (msg.action === 'ice') {
+        if (!pc) return;
+        if (!pc.remoteDescription) {
+          pendingIncomingIce.push(msg.candidate);
+        } else {
+          try { await pc.addIceCandidate(msg.candidate); } catch (e) { log('addIce err', e); }
+        }
+      }
+    };
+  };
+
+  btnDisconnect.onclick = () => {
+    if (ws) try { ws.close(); } catch {}
+    ws = null;
+  };
+
+  // ---- WebRTC wiring ----
+  btnStart.onclick = async () => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) { setStatus('Connect bridge first.'); return; }
+
+    const [w, h] = (resSel.value || '640x480').split('x').map(Number);
+    const fps = parseInt(fpsSel.value || '0', 10);
+
+    offered = false;
+    pendingOutgoingIce = [];
+    pendingIncomingIce = [];
+
+    // Create RTCPeerConnection (no STUN for LAN)
+    pc = new RTCPeerConnection({ iceServers: [] });
+
+    pc.onconnectionstatechange = () => log('pc.connectionState=', pc.connectionState);
+    pc.oniceconnectionstatechange = () => log('pc.iceConnectionState=', pc.iceConnectionState);
+    pc.onicegatheringstatechange = () => log('pc.iceGatheringState=', pc.iceGatheringState);
+
+    // Attach remote track to video element
+    pc.ontrack = (e) => {
+      videoEl.srcObject = e.streams[0];
+      setStatus(`Streaming ${w}x${h}${fps ? ` @${fps}fps` : ''}`);
+    };
+
+    // Buffer outgoing ICE until we send the offer
+    pc.onicecandidate = (e) => {
+      if (!e.candidate) return;
+      if (!offered) pendingOutgoingIce.push(e.candidate);
+      else ws.send(JSON.stringify({ action: 'ice', candidate: e.candidate }));
+    };
+
+    // Create recvonly offer
+    const offer = await pc.createOffer({ offerToReceiveVideo: true });
+    await pc.setLocalDescription(offer);
+
+    // Wait for ICE gather complete => non-trickle offer (more robust over WS)
+    if (pc.iceGatheringState !== 'complete') {
+      await new Promise((resolve) => {
+        const check = () => {
+          if (pc.iceGatheringState === 'complete') {
+            pc.removeEventListener('icegatheringstatechange', check);
+            resolve();
+          }
+        };
+        pc.addEventListener('icegatheringstatechange', check);
+      });
+    }
+
+    // Send the offer with desired constraints
+    ws.send(JSON.stringify({
+      action: 'offer',
+      sdp: pc.localDescription.sdp,
+      constraints: { width: w, height: h, fps }
+    }));
+    offered = true;
+
+    // Flush any ICE gathered before the offer was sent
+    for (const c of pendingOutgoingIce) {
+      ws.send(JSON.stringify({ action: 'ice', candidate: c }));
+    }
+    pendingOutgoingIce = [];
+
+    btnStart.disabled = true;
+    btnStop.disabled = false;
+    setStatus('Negotiating…');
+  };
+
+  btnStop.onclick = () => {
+    if (pc) {
+      try { pc.getSenders().forEach(s => s.track && s.track.stop()); } catch {}
+      try { pc.getReceivers().forEach(r => r.track && r.track.stop()); } catch {}
+      try { pc.close(); } catch {}
+    }
+    pc = null;
+    videoEl.srcObject = null;
+    btnStart.disabled = false;
+    btnStop.disabled = true;
+    setStatus('Stopped.');
+  };
+})();
+</script>
+</body>
+</html>

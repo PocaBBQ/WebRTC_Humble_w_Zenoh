@@ -1,0 +1,108 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WebRTC: C920e Direct Stream</title>
+  <style>body{font-family:system-ui;margin:2rem} video{width:100%;max-width:960px;border-radius:12px}</style>
+</head>
+<body>
+  <h2>ROS Streamer</h2>
+
+  <p id="status">Loading camera capabilities…</p>
+  <video id="v" autoplay playsinline controls muted style="width:100%;max-width:960px;background:#000;border-radius:12px"></video>
+
+  <div class="row">
+    <label for="res">Resolution:</label>
+    <select id="res" disabled></select>
+
+    <label for="fps">FPS:</label>
+    <select id="fps" disabled></select>
+
+    <button id="go" disabled>Start</button>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const resSel = document.getElementById('res');
+    const fpsSel = document.getElementById('fps');
+    const goBtn = document.getElementById('go');
+
+    let fpsByRes = {};
+
+    async function loadCaps() {
+      try {
+        const r = await fetch('/caps');
+        const caps = await r.json();
+        fpsByRes = caps.fps_by_resolution || {};
+        const resolutions = caps.resolutions || Object.keys(fpsByRes);
+
+        resSel.innerHTML = '';
+        resolutions.forEach(r => {
+          const opt = document.createElement('option');
+          opt.value = r;
+          opt.textContent = r;
+          resSel.appendChild(opt);
+        });
+
+        resSel.disabled = false;
+        updateFpsOptions();
+        goBtn.disabled = false;
+        statusEl.textContent = 'Ready.';
+      } catch (e) {
+        statusEl.textContent = 'Failed to load capabilities: ' + e;
+      }
+    }
+
+    function updateFpsOptions() {
+      const res = resSel.value;
+      const fpsList = fpsByRes[res] || [30];
+      fpsSel.innerHTML = '';
+      fpsList.forEach(f => {
+        const opt = document.createElement('option');
+        opt.value = f;
+        opt.textContent = f + ' fps';
+        fpsSel.appendChild(opt);
+      });
+      fpsSel.disabled = false;
+    }
+
+    resSel.addEventListener('change', updateFpsOptions);
+
+    async function start() {
+      const [w, h] = resSel.value.split('x').map(Number);
+      const f = parseInt(fpsSel.value || '0', 10);
+
+      const pc = new RTCPeerConnection({ iceServers: [] }); // LAN-only; add STUN/TURN if needed
+      const video = document.getElementById('v');
+
+      pc.ontrack = (ev) => {
+        video.srcObject = ev.streams[0];
+        statusEl.textContent = `Streaming ${w}x${h}${f ? ' @'+f+'fps' : ''}`;
+      };
+
+      const offer = await pc.createOffer({ offerToReceiveVideo: true });
+      await pc.setLocalDescription(offer);
+
+      const resp = await fetch('/offer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sdp: pc.localDescription.sdp,
+          type: pc.localDescription.type,
+          constraints: { width: w, height: h, fps: f }
+        })
+      });
+      if (!resp.ok) {
+        statusEl.textContent = 'Offer failed: ' + resp.status + ' ' + resp.statusText;
+        return;
+      }
+      const answer = await resp.json();
+      await pc.setRemoteDescription(answer);
+    }
+
+    goBtn.addEventListener('click', () => start().catch(e => statusEl.textContent = 'Error: ' + e));
+
+    loadCaps();
+  </script>
+</body>
+</html>

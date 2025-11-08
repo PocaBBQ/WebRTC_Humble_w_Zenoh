@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+aiortc
+av
+websockets
+eclipse-zenoh
